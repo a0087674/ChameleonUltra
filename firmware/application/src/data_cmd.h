@@ -29,6 +29,7 @@
 #define DATA_CMD_GET_SLOT_INFO                  (1019)
 #define DATA_CMD_WIPE_FDS                       (1020)
 #define DATA_CMD_DELETE_SLOT_TAG_NICK           (1021)
+#define DATA_CMD_SOFT_RESET                     (1022)
 
 #define DATA_CMD_GET_ENABLED_SLOTS              (1023)
 #define DATA_CMD_DELETE_SLOT_SENSE_TYPE         (1024)
@@ -46,6 +47,7 @@
 #define DATA_CMD_GET_BLE_PAIRING_ENABLE         (1036)
 #define DATA_CMD_SET_BLE_PAIRING_ENABLE         (1037)
 #define DATA_CMD_GET_ALL_SLOT_NICKS             (1038)
+#define DATA_CMD_NFCT_RESET                     (1039)
 
 //
 // ******************************************************************

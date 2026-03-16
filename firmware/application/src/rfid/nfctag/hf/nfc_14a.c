@@ -752,3 +752,20 @@ void nfc_tag_14a_set_reset_enable(bool enable) {
 bool nfc_tag_14a_is_reset_enable() {
     return reset_if_field_lost;
 }
+
+void nfc_tag_14a_hard_reset(void) {
+    // Uninit via state machine if currently enabled (stops active NFCT transactions)
+    if (m_nfc_sense_state == NFC_SENSE_STATE_ENABLE) {
+        nrfx_nfct_uninit();
+    }
+    // Full power cycle of NFCT peripheral at 0x40005000 (POWER register at base+0xFFC).
+    // This is the only reliable way to fully reset accumulated NFCT hardware state
+    // without a full MCU restart. nrf_nfct_reset() alone is insufficient –
+    // only a power cycle (or sleep+restart) clears the corrupt state.
+    // Same technique used by nRFx SDK for NFCT anomaly 190 workaround.
+    *(volatile uint32_t *)0x40005FFC = 0;   // NFCT peripheral power off
+    for (volatile int i = 0; i < 100; i++) {} // brief settling delay
+    *(volatile uint32_t *)0x40005FFC = 1;   // NFCT peripheral power on
+    // Reset state machine to NONE so next sense_switch(true) re-initializes cleanly
+    m_nfc_sense_state = NFC_SENSE_STATE_NONE;
+}

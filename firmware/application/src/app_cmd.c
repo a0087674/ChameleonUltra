@@ -14,6 +14,12 @@
 #include "settings.h"
 #include "delayed_reset.h"
 #include "netdata.h"
+#include "nfc_14a.h"
+#include "nrf_soc.h"
+
+// GPREGRET bit set before SOFT_RESET to signal app_main to boot in reader mode.
+// Reader mode on boot prevents NFCT from emulating during the post-reset window.
+#define GPREGRET_READER_MODE_ON_BOOT  0x40
 
 
 #define NRF_LOG_MODULE_NAME app_cmd
@@ -890,6 +896,19 @@ static data_frame_tx_t *cmd_processor_wipe_fds(uint16_t cmd, uint16_t status, ui
     return data_frame_make(cmd, status, 0, NULL);
 }
 
+static data_frame_tx_t *cmd_processor_soft_reset(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    // Signal app_main to boot directly in reader mode (no emulation after reset).
+    // GPREGRET survives soft reset; app_main reads and clears this bit at startup.
+    sd_power_gpregret_set(0, GPREGRET_READER_MODE_ON_BOOT);
+    delayed_reset(50);
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_nfct_reset(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    nfc_tag_14a_hard_reset();
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
+
 static bool get_active_em410x_type(tag_specific_type_t *tag_type_out, uint16_t *id_size_out) {
     tag_slot_specific_type_t tag_types;
     tag_emulation_get_specific_types_by_slot(tag_emulation_get_slot(), &tag_types);
@@ -1652,6 +1671,7 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_GET_ACTIVE_SLOT,              NULL,                        cmd_processor_get_active_slot,               NULL                   },
     {    DATA_CMD_GET_SLOT_INFO,                NULL,                        cmd_processor_get_slot_info,                 NULL                   },
     {    DATA_CMD_WIPE_FDS,                     NULL,                        cmd_processor_wipe_fds,                      NULL                   },
+    {    DATA_CMD_SOFT_RESET,                   NULL,                        cmd_processor_soft_reset,                    NULL                   },
     {    DATA_CMD_DELETE_SLOT_TAG_NICK,         NULL,                        cmd_processor_delete_slot_tag_nick,          NULL                   },
     {    DATA_CMD_GET_ENABLED_SLOTS,            NULL,                        cmd_processor_get_enabled_slots,             NULL                   },
     {    DATA_CMD_DELETE_SLOT_SENSE_TYPE,       NULL,                        cmd_processor_delete_slot_sense_type,        NULL                   },
@@ -1671,6 +1691,8 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_GET_ALL_SLOT_NICKS,           NULL,                        cmd_processor_get_all_slot_nicks,            NULL                   },
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
+
+    {    DATA_CMD_NFCT_RESET,                   NULL,                        cmd_processor_nfct_reset,                    NULL                   },
 
     {    DATA_CMD_HF14A_SCAN,                   before_hf_reader_run,        cmd_processor_hf14a_scan,                    after_hf_reader_run    },
     {    DATA_CMD_MF1_DETECT_SUPPORT,           before_hf_reader_run,        cmd_processor_mf1_detect_support,            after_hf_reader_run    },

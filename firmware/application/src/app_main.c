@@ -68,6 +68,8 @@ static uint32_t m_reset_source;
 static uint32_t m_gpregret_val;
 
 #define GPREGRET_CLEAR_VALUE_DEFAULT (0xFFFFFFFFUL)
+// SOFT_RESET sets this bit in GPREGRET reg 0 to signal: boot in reader mode (no emulation)
+#define GPREGRET_READER_MODE_ON_BOOT  0x40
 #define RESET_ON_LF_FIELD_EXISTS_Msk (1UL)
 
 extern bool g_is_low_battery_shutdown;
@@ -1011,7 +1013,16 @@ int main(void) {
     on_data_frame_complete(on_data_frame_received);
 
     check_wakeup_src();       // Detect wake-up source and decide BLE broadcast and subsequent hibernation action according to the wake-up source
-    tag_mode_enter();         // Enter card emulation mode by default
+    // Check GPREGRET reg 0 for reader-mode-on-boot flag (set by SOFT_RESET command).
+    // This prevents NFCT from emulating during the post-reset window.
+    uint32_t gpregret0 = 0;
+    sd_power_gpregret_get(0, &gpregret0);
+    if (gpregret0 & GPREGRET_READER_MODE_ON_BOOT) {
+        sd_power_gpregret_clr(0, GPREGRET_READER_MODE_ON_BOOT);
+        reader_mode_enter();  // booted via SOFT_RESET: stay silent, no emulation
+    } else {
+        tag_mode_enter();     // normal boot: enter card emulation mode by default
+    }
 
     // usbd event listener
     APP_ERROR_CHECK(app_usbd_power_events_enable());

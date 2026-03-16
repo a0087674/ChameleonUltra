@@ -119,4 +119,7 @@ bool is_valid_uid_size(uint8_t uid_length);
 void nfc_tag_14a_set_reset_enable(bool enable);
 bool nfc_tag_14a_is_reset_enable();
 
+// Hard reset of NFCT peripheral without MCU restart (USB stays connected)
+void nfc_tag_14a_hard_reset(void);
+
 #endif
