@@ -19,8 +19,9 @@ Beispiele:
   python tag_simulator.py --type ntag213 --id 04A1B2C3D4E5F6 --duration 10 --slot 2
   python tag_simulator.py --type mf1k --id DEADBEEF --duration 0   # läuft bis Strg+C
   python tag_simulator.py --port COM3 --type mf1k --id 11223344 --duration 30
-  python tag_simulator.py --type mf1k --id DEADBEEF --duration 30 --reset  # NFCT_RESET am Ende (kein Neustart, USB bleibt)
+  python tag_simulator.py --type mf1k --id DEADBEEF --duration 30 --reset  # SOFT_RESET am Ende (kein FDS-Wipe)
 """
+
 
 import struct
 import sys
@@ -168,10 +169,12 @@ class TagSimulator:
 
     def setup_hf_tag(self, cfg: dict, uid: bytes):
         """Konfiguriert einen HF-Tag (Mifare / NTAG)."""
-        # Alle Konfiguration und FDS-Schreibvorgänge werden im Reader-Modus
-        # (NFCT aus) durchgeführt. Erst ganz am Ende wird auf Emulator-Modus
-        # gewechselt. So können Flash-Interrupts (FDS GC) das NFCT-Timing
-        # nicht stören → keine intermittierenden Erkennungsfehler.
+        # Reader-Modus → dann wieder Emulator-Modus ist zwingend nötig:
+        # tag_emulation_sense_run() (NFC-Sensing einschalten) wird nur in
+        # tag_mode_enter() aufgerufen, und tag_mode_enter() ist ein No-Op wenn
+        # das Gerät bereits im Emulator-Modus ist. Wir müssen also den Übergang
+        # READER → TAG erzwingen damit NFC-Sensing für den aktivierten Slot
+        # tatsächlich eingeschaltet wird.
         self.cmd.set_device_reader_mode(True)
         time.sleep(0.3)
 
@@ -202,14 +205,19 @@ class TagSimulator:
         # der automatische Slot-Wechsel in cmd_processor_set_slot_enable wird NICHT ausgelöst.
         self.cmd.set_slot_enable(self.slot, TagSenseType.LF, False)
 
-        # Anti-Coll-Daten setzen und speichern – noch im Reader-Modus (NFCT aus).
-        # slot_data_config_save() löst einen FDS-Schreibvorgang aus; dieser darf
-        # nicht gleichzeitig mit aktivem NFCT laufen, da Flash-Interrupts das
-        # 600-µs-Mifare-Auth-Timing-Fenster unterbrechen können.
+        # Jetzt in Emulator-Modus wechseln: tag_mode_enter() läuft vollständig
+        # (da wir aus Reader-Modus kommen) → ruft tag_emulation_sense_run() →
+        # NFC-Sensing wird für den jetzt aktivierten Slot eingeschaltet.
+        self.cmd.set_device_reader_mode(False)
+        time.sleep(0.3)
+
         ac = self.cmd.hf14a_get_anti_coll_data()
         atqa = bytes(ac["atqa"])
         sak  = bytes(ac["sak"])
         self.cmd.hf14a_set_anti_coll_data(uid=uid, atqa=atqa, sak=sak, ats=b"")
+        # Jetzt speichern: slot_data_config_save ruft tag_emulation_save_data()
+        # auf, das die aktualisierten Anti-Coll-Daten (UID=uid) aus dem RAM in
+        # den Flash schreibt.
         self.cmd.slot_data_config_save()
 
         rb = self.cmd.hf14a_get_anti_coll_data()
@@ -222,14 +230,6 @@ class TagSimulator:
             )
         else:
             print_status(f"UID-Mismatch! Erwartet {uid.hex().upper()}, Gerät={actual}", ok=False)
-
-        # Erst jetzt in Emulator-Modus wechseln: tag_mode_enter() läuft vollständig
-        # (da wir aus Reader-Modus kommen) → ruft tag_emulation_sense_run() →
-        # NFC-Sensing wird für den jetzt aktivierten Slot eingeschaltet.
-        # Längere Pause damit der NFCT-Peripheral vollständig initialisiert ist,
-        # bevor der Reader anfängt zu pollen.
-        self.cmd.set_device_reader_mode(False)
-        time.sleep(0.5)
 
     def setup_lf_tag(self, cfg: dict, uid: bytes):
         """Konfiguriert einen LF-Tag (EM410x)."""
@@ -281,21 +281,23 @@ class TagSimulator:
             print_status(f"Warnung beim Wiederherstellen: {e}", ok=False)
 
     def device_reset(self):
-        """MCU-Neustart via SOFT_RESET (Cmd 1022, kein FDS-Wipe).
-        Setzt den NFCT-Peripheral vollständig zurück. Vor dem Reset wird
-        GPREGRET Bit 6 gesetzt → Gerät bootet direkt in Reader-Modus →
-        keine Emulation nach dem Neustart, kein Reconnect nötig."""
+        """Startet das Gerät neu (SOFT_RESET = delayed_reset ohne fds_wipe).
+        Setzt den NFCT-Peripheral zurück ohne FDS-Daten zu löschen.
+        restore() hat den Slot bereits deaktiviert und in FDS gespeichert →
+        nach dem Neustart emuliert das Gerät nichts."""
         if self.cmd is None:
             return
         try:
-            # SOFT_RESET (Cmd 1022): setzt GPREGRET Bit 6, dann delayed_reset(50ms).
-            # Firmware liest GPREGRET beim Boot → Reader-Modus → keine Emulation.
+            # SOFT_RESET (Cmd 1022): nur delayed_reset(50ms), kein fds_wipe.
+            # FDS bleibt erhalten → Gerät bootet mit dem von restore() gespeicherten
+            # Zustand (Slot deaktiviert) → keine unerwünschte Emulation nach dem Neustart.
             self.cmd.device.send_cmd_sync(Command.SOFT_RESET, timeout=5)
-            print_status("Gerät wird neugestartet (NFCT-Reset, bootet in Reader-Modus)")
+            print_status("Gerät wird neugestartet (NFCT-Reset) – FDS-Daten bleiben erhalten")
         except Exception:
             pass
-        # Verbindung schliessen bevor der Port durch den MCU-Neustart wegbricht
-        # (setzt event_closing → unterdrückt "Serial Error"-Meldung).
+        # Verbindung JETZT schliessen: setzt event_closing, bevor der serielle Port
+        # durch den MCU-Neustart (50ms Delay in Firmware) wegbricht.
+        # Dadurch unterdrückt thread_data_receive die "Serial Error"-Meldung.
         self.device.close()
         time.sleep(1.0)  # Auf Neustart warten
 
@@ -381,10 +383,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help=(
-            "NFCT-Peripheral nach der Simulation zurücksetzen (Cmd 1039, kein MCU-Neustart). "
-            "Behebt das kumulative NFCT-Bug-Problem nach ~3 Runs. "
-            "USB bleibt verbunden, FDS-Daten bleiben erhalten. "
-            "Erfordert Firmware mit NFCT_RESET-Befehl."
+            "Gerät nach der Simulation per SOFT_RESET neu starten. "
+            "Setzt den NFCT-Peripheral zurück und behebt das kumulative Firmware-Bug-Problem "
+            "das nach ~3 Runs auftritt. FDS-Daten bleiben erhalten. "
+            "Erfordert Firmware mit SOFT_RESET-Befehl (Cmd 1022)."
         ),
     )
     return parser
@@ -436,7 +438,7 @@ def main():
     dur_str = format_duration(args.duration) if args.duration > 0 else "unbegrenzt (Strg+C)"
     print(f"  Dauer    : {dur_str}")
     print(f"  Port     : {port}")
-    print(f"  Reset    : {'ja (NFCT_RESET, USB bleibt)' if args.reset else 'nein'}")
+    print(f"  Reset    : {'ja (SOFT_RESET nach Simulation)' if args.reset else 'nein'}")
     print("=" * 55)
 
     sim = TagSimulator(port=port, slot=slot)
