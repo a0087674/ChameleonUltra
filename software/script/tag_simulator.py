@@ -29,6 +29,16 @@ import time
 import signal
 import argparse
 from pathlib import Path
+from robot.api import logger
+
+# Robot Framework integration (optional – CLI mode still works without it)
+try:
+    from robot.api.deco import keyword
+    from robot.api import logger as rf_logger
+    ROBOT_AVAILABLE = True
+except ImportError:
+    ROBOT_AVAILABLE = False
+    rf_logger = None
 
 # Sicherstellen, dass die Chameleon-Module gefunden werden
 sys.path.insert(0, str(Path(__file__).parent))
@@ -205,20 +215,47 @@ class TagSimulator:
         # der automatische Slot-Wechsel in cmd_processor_set_slot_enable wird NICHT ausgelöst.
         self.cmd.set_slot_enable(self.slot, TagSenseType.LF, False)
 
-        # Jetzt in Emulator-Modus wechseln: tag_mode_enter() läuft vollständig
-        # (da wir aus Reader-Modus kommen) → ruft tag_emulation_sense_run() →
-        # NFC-Sensing wird für den jetzt aktivierten Slot eingeschaltet.
-        self.cmd.set_device_reader_mode(False)
-        time.sleep(0.3)
+        # UID + Block 0 MÜSSEN im Reader-Modus gesetzt werden, BEVOR wir in den
+        # Emulator-Modus wechseln. set_device_reader_mode(False) startet NFC-
+        # Sensing sofort → ab dann antwortet das Gerät auf Reader-Anfragen.
+        # Wenn die UID erst danach gesetzt wird, sieht der Reader die Default-UID
+        # (DEADBEEF / EFBEADDE in Little-Endian).
 
+        # Anti-Kollisions-Daten: UID für ISO 14443-3A Anti-Collision setzen.
+        # Funktioniert auch im Reader-Modus, da es nur RAM-Strukturen patcht.
         ac = self.cmd.hf14a_get_anti_coll_data()
         atqa = bytes(ac["atqa"])
         sak  = bytes(ac["sak"])
         self.cmd.hf14a_set_anti_coll_data(uid=uid, atqa=atqa, sak=sak, ats=b"")
-        # Jetzt speichern: slot_data_config_save ruft tag_emulation_save_data()
-        # auf, das die aktualisierten Anti-Coll-Daten (UID=uid) aus dem RAM in
-        # den Flash schreibt.
+
+        # Block 0 der Mifare-Classic-Daten aktualisieren: SET_SLOT_DATA_DEFAULT
+        # lädt die Default-UID (DEADBEEF) in Block 0. Viele Reader lesen nach
+        # Authentifizierung Block 0 und verwenden die UID daraus – nicht die
+        # Anti-Kollisions-UID. Ohne diesen Schritt zeigt der Reader DEADBEEF
+        # (bzw. EFBEADDE in umgekehrter Byte-Reihenfolge).
+        if len(uid) == 4:
+            bcc = uid[0] ^ uid[1] ^ uid[2] ^ uid[3]
+            block0 = uid + bytes([bcc]) + b'\x00' * 11
+            self.cmd.mf1_write_emu_block_data(0, block0)
+        elif len(uid) == 7:
+            bcc0 = 0x88 ^ uid[0] ^ uid[1] ^ uid[2]
+            block0 = bytes([uid[0], uid[1], uid[2], bcc0,
+                            uid[3], uid[4], uid[5], uid[6],
+                            uid[3] ^ uid[4] ^ uid[5] ^ uid[6],
+                            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+            self.cmd.mf1_write_emu_block_data(0, block0)
+
+        # In Flash speichern, noch im Reader-Modus: slot_data_config_save ruft
+        # tag_emulation_save_data() auf, das die aktualisierten Anti-Coll-Daten
+        # (UID=uid) und Block-Daten aus dem RAM in den Flash schreibt.
         self.cmd.slot_data_config_save()
+
+        # JETZT in Emulator-Modus wechseln: tag_mode_enter() läuft vollständig
+        # (da wir aus Reader-Modus kommen) → ruft tag_emulation_sense_run() →
+        # NFC-Sensing wird für den jetzt aktivierten Slot eingeschaltet.
+        # Die korrekte UID ist bereits in RAM + Flash → Reader sieht sofort 99999999.
+        self.cmd.set_device_reader_mode(False)
+        time.sleep(0.3)
 
         rb = self.cmd.hf14a_get_anti_coll_data()
         actual = bytes(rb["uid"]).hex().upper()
@@ -305,7 +342,7 @@ class TagSimulator:
         """Wartet für die angegebene Dauer mit Fortschrittsanzeige."""
         self._active = True
         if duration <= 0:
-            print("\n  Tag ist aktiv. Drücke Strg+C zum Beenden.\n")
+            # print("\n  Tag ist aktiv. Drücke Strg+C zum Beenden.\n")
             while self._active:
                 time.sleep(0.5)
         else:
@@ -319,13 +356,13 @@ class TagSimulator:
                 elapsed = duration - remaining
                 filled = int(bar_total * elapsed / duration)
                 bar = "=" * filled + "-" * (bar_total - filled)
-                print(
-                    f"\r  [{bar}] {remaining:6.1f}s verbleibend  ",
-                    end="",
-                    flush=True,
-                )
+                # print(
+                #     f"\r  [{bar}] {remaining:6.1f}s verbleibend  ",
+                #     end="",
+                #     flush=True,
+                # )
                 time.sleep(0.2)
-            print(f"\r  [{'=' * 40}]   0.0s verbleibend  ")
+            # print(f"\r  [{'=' * 40}]   0.0s verbleibend  ")
 
     def stop(self):
         self._active = False
@@ -334,6 +371,128 @@ class TagSimulator:
 # ---------------------------------------------------------------------------
 # Argument-Parser
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Robot Framework Library
+# ---------------------------------------------------------------------------
+
+class tag_simulator:
+    """Robot Framework keyword library for ChameleonUltra tag simulation.
+
+    Usage in .robot / .resource files::
+
+        Library    path/to/tag_simulator.py
+
+        *** Test Cases ***
+        Simulate A Tag
+            Simulate Mifare Classic Chameleon    uuid=DEADBEEF    zeitdauer=30
+    """
+
+    ROBOT_LIBRARY_SCOPE = 'GLOBAL'
+
+    def _log(self, msg, level='INFO'):
+        if ROBOT_AVAILABLE and rf_logger:
+            rf_logger.info(msg) if level == 'INFO' else rf_logger.console(msg)
+        else:
+            print(msg)
+
+    @keyword("Simulate Mifare Classic Chameleon")
+    def simulate_tag(self, uuid, zeitdauer=2000, tag_type='mf1k', reset=True,
+                     port=None, slot=1):
+        """Simuliert ein RFID-Tag für die angegebene Dauer.
+
+        Args:
+            uuid (str):       Tag-ID als Hex-String (z.B. ``DEADBEEF``).
+            zeitdauer (int|float): Dauer der Simulation in Millisekunden (0 = unbegrenzt, default 2000).
+            tag_type (str):   Tag-Typ (default ``mf1k``). Erlaubt: mf1k, mf4k,
+                              mfmini, ntag213, ntag215, ntag216, em410x.
+            reset (bool):     SOFT_RESET nach Simulation (default ``True``).
+            port (str|None):  Serieller Port. ``None`` = automatische Erkennung.
+            slot (int):       Geräte-Slot 1–8 (default ``1``).
+
+        Returns:
+            bool: ``True`` wenn Simulation erfolgreich.
+
+        Examples:
+            | Simulate Mifare Classic Chameleon | uuid=DEADBEEF | zeitdauer=2000 |
+            | Simulate Mifare Classic Chameleon | uuid=AABBCCDDEE | zeitdauer=5000 | tag_type=em410x | reset=${FALSE} |
+        """
+        # --- Parameter normalisieren ---
+        zeitdauer = float(zeitdauer) / 1000.0  # ms → s
+        slot = int(slot)
+        if isinstance(reset, str):
+            reset = reset.lower() not in ('false', '0', 'no', 'off')
+
+        tag_type = str(tag_type).lower()
+        if tag_type not in TAG_CONFIGS:
+            raise ValueError(
+                f"Unbekannter Tag-Typ '{tag_type}'. "
+                f"Erlaubt: {', '.join(TAG_CONFIGS.keys())}"
+            )
+        cfg = TAG_CONFIGS[tag_type]
+
+        logger.console(uuid)
+        uid = parse_hex_id(uuid, cfg['uid_lengths'])
+        # uid = bytes.fromhex(uuid)
+        logger.console(uuid)
+
+        try:
+            slot_enum = SlotNumber(slot)
+        except ValueError:
+            raise ValueError(f"Ungültiger Slot: {slot}. Erlaubt: 1–8.")
+
+        # --- Port ermitteln ---
+        if port is None:
+            port = auto_detect_port()
+            if port is None:
+                raise RuntimeError(
+                    "ChameleonUltra nicht gefunden. "
+                    "Bitte 'port' angeben oder Gerät per USB verbinden."
+                )
+            self._log(f"Gerät automatisch erkannt: {port}")
+
+        self._log(
+            f"Simulate Tag: type={cfg['name']}  uid={uid.hex().upper()}  "
+            f"slot={slot}  dauer={zeitdauer}s  reset={reset}  port={port}"
+        )
+
+        sim = TagSimulator(port=port, slot=slot_enum)
+        try:
+            sim.connect()
+
+            if cfg['sense'] == TagSenseType.HF:
+                sim.setup_hf_tag(cfg, uid)
+            else:
+                sim.setup_lf_tag(cfg, uid)
+
+            # USB-Polling pausieren
+            wait_timeout = (zeitdauer + 30) if zeitdauer > 0 else 3600
+            try:
+                sim.device.transport.timeout = wait_timeout
+            except Exception:
+                pass
+
+            self._log("Simulation läuft …")
+            sim.wait(zeitdauer)
+
+        except Exception as exc:
+            self._log(f"Fehler während Simulation: {exc}")
+            raise
+        finally:
+            try:
+                sim.device.transport.timeout = 0.1
+            except Exception:
+                pass
+
+            sim.restore(cfg['sense'])
+            if reset:
+                self._log("Starte Gerät neu (NFCT-Reset) …")
+                sim.device_reset()
+            sim.disconnect()
+            self._log("Simulation beendet.")
+
+        return True
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
